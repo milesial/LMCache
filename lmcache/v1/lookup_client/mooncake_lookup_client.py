@@ -91,6 +91,16 @@ class MooncakeLookupClient(LookupClientInterface):
         """Return True as MooncakeLookupClient supports producer kvcache reuse"""
         return True
 
+    def clear_cache(self) -> bool:
+        """Report that Mooncake lookup cache reset is unsupported.
+
+        Returns:
+            False because this lookup client does not have a verified
+            Mooncake clear-cache API contract.
+        """
+        logger.warning("Mooncake lookup client does not support clear_cache.")
+        return False
+
     def close(self):
         # nothing here
         pass

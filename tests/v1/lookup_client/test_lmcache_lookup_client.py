@@ -152,6 +152,35 @@ class TestLMCacheLookupClientServer:
                 # Test supports_producer_reuse
                 assert client.supports_producer_reuse() is True
 
+    def test_clear_cache_communication(self, lmcache_engine):
+        """Test cache clear communication between client and server."""
+        device = "cpu"
+        num_tokens = 512
+        num_blocks = 100
+        block_size = 16
+
+        tokens = generate_tokens(num_tokens, device, fixed=True)
+        kv_cache = generate_kv_cache_paged_list_tensors(num_blocks, device, block_size)
+        slot_mapping = random.sample(range(0, num_blocks * block_size), num_tokens)
+        slot_mapping = torch.tensor(slot_mapping, device=device)
+
+        lmcache_engine.store(
+            tokens=tokens, kvcaches=kv_cache, slot_mapping=slot_mapping
+        )
+        recover_engine_states(lmcache_engine)
+        time.sleep(0.5)
+
+        with self._create_server(lmcache_engine):
+            time.sleep(0.5)
+            with self._create_client(lmcache_engine) as client:
+                client.reqs_status["stale_request"] = num_tokens
+
+                assert client.clear_cache() is True
+                assert client.reqs_status == {}
+
+                result = client.lookup(tokens.tolist(), "after_clear")
+                assert result == 0
+
     def test_multiple_lookups(self, lmcache_engine):
         """Test multiple lookup requests."""
         device = "cpu"

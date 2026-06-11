@@ -617,6 +617,34 @@ class LMCacheConnectorV1Impl:
             )
             self._manager.post_init()
 
+    def reset_cache(self) -> bool | None:
+        """Reset LMCache-managed KV cache state for vLLM.
+
+        vLLM calls this as an admin reset. The scheduler should have stopped
+        or preempted active requests first; worker lookup servers process the
+        clear inline, so lookup handling stalls until the slowest worker
+        finishes clearing its backends. Size `clear_cache_timeout_ms`
+        accordingly when host or remote caches are large.
+
+        Returns:
+            True when the scheduler clears the backend cache successfully,
+            False when the scheduler reset request fails, and None for
+            worker-side no-op calls.
+        """
+        if self._role != KVConnectorRole.SCHEDULER:
+            return None
+
+        self._unfinished_requests.clear()
+        self.load_specs.clear()
+        self._request_trackers.clear()
+        self._requests_priority.clear()
+        self._invalid_block_ids.clear()
+
+        if self.lookup_client is None:
+            logger.warning("LMCache reset requested without a lookup client.")
+            return False
+        return self.lookup_client.clear_cache()
+
     # ==================== Property Accessors ====================
 
     @property

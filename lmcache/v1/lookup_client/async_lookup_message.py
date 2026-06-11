@@ -20,6 +20,7 @@ class LookupRequestMsg(AsyncLookupMsg):
     hashes: list[int]
     offsets: list[int]
     request_configs: Optional[Dict[str, str]] = None
+    lookup_epoch: int = 0
 
     def describe(self) -> str:
         return (
@@ -33,6 +34,7 @@ class LookupResponseMsg(AsyncLookupMsg):
 
     lookup_id: str
     num_hit_tokens: int
+    lookup_epoch: int = 0
 
     def describe(self) -> str:
         return (
@@ -48,3 +50,22 @@ class LookupCleanupMsg(AsyncLookupMsg):
 
     def describe(self) -> str:
         return f"Cleanup memory for lookup_id={self.lookup_id}"
+
+
+class LookupClearMsg(AsyncLookupMsg):
+    """Clear-cache message from scheduler to worker."""
+
+    clear_id: str
+
+    def describe(self) -> str:
+        return f"Clear cache for clear_id={self.clear_id}"
+
+
+class LookupClearResponseMsg(AsyncLookupMsg):
+    """Clear-cache response from worker to scheduler."""
+
+    clear_id: str
+    success: bool
+
+    def describe(self) -> str:
+        return f"Clear cache response for clear_id={self.clear_id}: {self.success}"

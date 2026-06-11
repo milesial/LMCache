@@ -206,3 +206,13 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def reset_cache(self) -> bool | None:
+        """
+        Reset LMCache-managed KV cache state.
+
+        Returns:
+            True if the scheduler-side reset succeeds, False if it fails, and
+            None for worker-side no-op calls.
+        """
+        return self._lmcache_engine.reset_cache()

@@ -159,6 +159,13 @@ class ChunkStatisticsLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.actual_lookup_client.clear_lookup_status(lookup_id)
 
+    def clear_cache(self) -> bool:
+        """Clear cache through the wrapped lookup client.
+
+        Chunk statistics are preserved across cache clears.
+        """
+        return self.actual_lookup_client.clear_cache()
+
     def supports_producer_reuse(self) -> bool:
         return self.actual_lookup_client.supports_producer_reuse()
 

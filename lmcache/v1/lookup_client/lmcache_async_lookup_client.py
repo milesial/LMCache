@@ -13,9 +13,14 @@ import zmq
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
+from lmcache.v1.lookup_client.abstract_client import (
+    DEFAULT_CLEAR_CACHE_TIMEOUT_MS,
+    LookupClientInterface,
+)
 from lmcache.v1.lookup_client.async_lookup_message import (
     LookupCleanupMsg,
+    LookupClearMsg,
+    LookupClearResponseMsg,
     LookupRequestMsg,
     LookupResponseMsg,
 )
@@ -134,6 +139,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # map from lookup_id (i.e., req_id) to number of hit tokens for each worker
         self.res_for_each_worker: dict[str, list[int]] = {}
 
+        self.reset_epoch = 0
+        self.lookup_epochs: dict[str, int] = {}
+
+        # Clear-cache response tracking for the single blocking clear_cache call.
+        self.clear_id: str | None = None
+        self.clear_results: list[bool] = []
+        self.clear_event = threading.Event()
+
         # The two parts are [lookup_id (i.e., req_id), num_hit_tokens]
         self.num_parts = 2
 
@@ -151,9 +164,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         # default backoff time
         self.lookup_backoff_time = 0.01
+        self.clear_timeout_ms = DEFAULT_CLEAR_CACHE_TIMEOUT_MS
         if config.extra_config is not None:
             self.lookup_backoff_time = float(
                 config.extra_config.get("lookup_backoff_time", self.lookup_backoff_time)
+            )
+            self.clear_timeout_ms = int(
+                config.extra_config.get("clear_cache_timeout_ms", self.clear_timeout_ms)
             )
 
     def lookup_cache(self, lookup_id: str) -> Optional[int]:
@@ -185,6 +202,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     )
                     self.cancel_lookup(lookup_id)
                     self.first_lookup_time.pop(lookup_id, None)
+                    self.lookup_epochs.pop(lookup_id, None)
                     return 0
 
             return req_status
@@ -204,12 +222,16 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             hashes.append(hash_val)  # type: ignore[arg-type]
             offsets.append(end - start)
 
+        lookup_epoch = self.reset_epoch
+        self.lookup_epochs[lookup_id] = lookup_epoch
+
         # Create structured message
         msg = LookupRequestMsg(
             lookup_id=lookup_id,
             hashes=hashes,
             offsets=offsets,
             request_configs=request_configs,
+            lookup_epoch=lookup_epoch,
         )
 
         # Serialize message using msgspec
@@ -225,25 +247,39 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             try:
                 msg_buf = self.pull_socket.recv(copy=False)
                 # Deserialize message using msgspec
-                msg = msgspec.msgpack.decode(msg_buf, type=LookupResponseMsg)
-                lookup_id = msg.lookup_id
-                res = msg.num_hit_tokens
+                msg = msgspec.msgpack.decode(
+                    msg_buf,
+                    type=LookupResponseMsg | LookupClearResponseMsg,
+                )
 
-                with self.lock:
-                    if lookup_id not in self.res_for_each_worker:
-                        self.res_for_each_worker[lookup_id] = [res]
-                    else:
-                        self.res_for_each_worker[lookup_id].append(res)
-                    all_res = self.res_for_each_worker[lookup_id]
+                if isinstance(msg, LookupResponseMsg):
+                    lookup_id = msg.lookup_id
+                    res = msg.num_hit_tokens
 
-                    if len(all_res) == self.world_size:
-                        self.res_for_each_worker.pop(lookup_id)
+                    with self.lock:
+                        if self.lookup_epochs.get(lookup_id) != msg.lookup_epoch:
+                            continue
+                        if lookup_id not in self.res_for_each_worker:
+                            self.res_for_each_worker[lookup_id] = [res]
+                        else:
+                            self.res_for_each_worker[lookup_id].append(res)
+                        all_res = self.res_for_each_worker[lookup_id]
 
-                        # NOTE: it is possible that the number of hit
-                        # tokens is different across (TP and PP) ranks, so we
-                        # can use the minimum value as the number of
-                        # hit tokens.
-                        self.reqs_status[lookup_id] = min(all_res)
+                        if len(all_res) == self.world_size:
+                            self.res_for_each_worker.pop(lookup_id)
+
+                            # NOTE: it is possible that the number of hit
+                            # tokens is different across (TP and PP) ranks, so we
+                            # can use the minimum value as the number of
+                            # hit tokens.
+                            self.reqs_status[lookup_id] = min(all_res)
+                            self.lookup_epochs.pop(lookup_id, None)
+                elif isinstance(msg, LookupClearResponseMsg):
+                    with self.lock:
+                        if msg.clear_id == self.clear_id:
+                            self.clear_results.append(msg.success)
+                            if len(self.clear_results) == self.world_size:
+                                self.clear_event.set()
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)
@@ -252,6 +288,59 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         with self.lock:
             self.reqs_status.pop(lookup_id, None)
             self.first_lookup_time.pop(lookup_id, None)
+            self.lookup_epochs.pop(lookup_id, None)
+
+    def clear_cache(self) -> bool:
+        """Clear worker-side LMCache contents and local lookup state.
+
+        Returns:
+            True when all workers report a successful clear, False on timeout
+            or if any worker reports a failure.
+        """
+        clear_id = f"clear-{time.time_ns()}"
+        msg = LookupClearMsg(clear_id=clear_id)
+        msg_buf = msgspec.msgpack.encode(msg)
+
+        with self.lock:
+            aborted_lookups = list(self.aborted_lookups)
+            self.first_lookup_time.clear()
+            self.reqs_status.clear()
+            self.res_for_each_worker.clear()
+            self.reset_epoch += 1
+            self.lookup_epochs.clear()
+            self.aborted_lookups.clear()
+            self.clear_id = clear_id
+            self.clear_results.clear()
+            self.clear_event.clear()
+
+        for lookup_id in aborted_lookups:
+            self._send_cleanup_message(lookup_id)
+
+        for i in range(self.world_size):
+            self.push_sockets[i].send(msg_buf, copy=False)
+
+        if self.clear_event.wait(self.clear_timeout_ms / 1000):
+            with self.lock:
+                results = self.clear_results.copy()
+                self.clear_results.clear()
+                self.clear_id = None
+            if not all(results):
+                logger.warning(
+                    "Clear cache failed on at least one worker: %s.",
+                    results,
+                )
+                return False
+            return True
+
+        with self.lock:
+            self.clear_id = None
+            self.clear_results.clear()
+            self.clear_event.clear()
+        logger.warning(
+            "Clear cache timed out after %d ms.",
+            self.clear_timeout_ms,
+        )
+        return False
 
     def cancel_lookup(self, lookup_id: str) -> None:
         """Mark lookup as aborted. Cleanup will happen after task finishes."""
@@ -337,6 +426,7 @@ class LMCacheAsyncLookupServer:
         )
 
         self.lmcache_engine = lmcache_engine
+        self.lookup_epochs: dict[str, int] = {}
         self.running = True
 
         logger.info(
@@ -357,15 +447,14 @@ class LMCacheAsyncLookupServer:
         while self.running:
             try:
                 msg_buf = self.pull_socket.recv(copy=False)
-                # rely on msgspec to automatically discriminate
-                # between LookupRequestMsg and LookupCleanupMsg
                 msg = msgspec.msgpack.decode(
                     msg_buf,
-                    type=Union[LookupRequestMsg, LookupCleanupMsg],
+                    type=LookupRequestMsg | LookupCleanupMsg | LookupClearMsg,
                 )
 
                 if isinstance(msg, LookupRequestMsg):
                     # Handle lookup request
+                    self.lookup_epochs[msg.lookup_id] = msg.lookup_epoch
                     self.lmcache_engine.async_lookup_and_prefetch(
                         lookup_id=msg.lookup_id,
                         hashes=msg.hashes,
@@ -376,7 +465,18 @@ class LMCacheAsyncLookupServer:
 
                 elif isinstance(msg, LookupCleanupMsg):
                     # Handle cleanup request - release memory objects for aborted lookup
+                    self.lookup_epochs.pop(msg.lookup_id, None)
                     self.lmcache_engine.cleanup_memory_objs(msg.lookup_id)
+
+                elif isinstance(msg, LookupClearMsg):
+                    try:
+                        self.lookup_epochs.clear()
+                        self.lmcache_engine.clear()
+                        success = True
+                    except Exception:
+                        logger.exception("Error clearing LMCache")
+                        success = False
+                    self.send_clear_response_to_scheduler(msg.clear_id, success)
 
                 else:
                     logger.warning("Unknown message type: %s", type(msg))
@@ -388,10 +488,21 @@ class LMCacheAsyncLookupServer:
         # Create structured response message
         msg = LookupResponseMsg(
             lookup_id=lookup_id,
+            lookup_epoch=self.lookup_epochs.pop(lookup_id, 0),
             num_hit_tokens=num_hit_tokens,
         )
 
         # Serialize message using msgspec
+        msg_buf = msgspec.msgpack.encode(msg)
+        self.push_socket.send(msg_buf, copy=False)
+
+    def send_clear_response_to_scheduler(self, clear_id: str, success: bool) -> None:
+        """Send a clear-cache response to the scheduler."""
+        msg = LookupClearResponseMsg(
+            clear_id=clear_id,
+            success=success,
+        )
+
         msg_buf = msgspec.msgpack.encode(msg)
         self.push_socket.send(msg_buf, copy=False)
 

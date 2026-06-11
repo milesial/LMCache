@@ -8,6 +8,7 @@ LMCacheAsyncLookupClient/Server.
 # Standard
 from collections import namedtuple
 from typing import Any
+import threading
 
 # Third Party
 import msgspec
@@ -47,6 +48,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         self.timeout_ms = timeout_ms
         self._world_size = len(socket_params)
         self.encoder = msgspec.msgpack.Encoder()
+        self.lock = threading.Lock()
 
         self.sockets: list[zmq.Socket] = []
         for params in self.socket_params:
@@ -70,6 +72,12 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
         return socket
+
+    def _set_socket_timeouts(self, timeout_ms: int) -> None:
+        """Set send and receive timeouts on all active sockets."""
+        for socket in self.sockets:
+            socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
 
     def _recreate_all_sockets(self) -> None:
         """Recreate all sockets after a failure."""
@@ -98,6 +106,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
     def send_and_recv_all(
         self,
         msg: list[Any],
+        timeout_ms: int | None = None,
     ) -> list[bytes]:
         """Send msg to all ranks and collect responses.
 
@@ -105,36 +114,45 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         sending. On timeout or ZMQ error, recreates all
         sockets and returns an empty list.
         """
-        encoded = [self.encoder.encode(m) for m in msg]
-        results: list[bytes] = []
-        failed_rank = -1
-        try:
-            for i in range(self._world_size):
-                failed_rank = i
-                self.sockets[i].send_multipart(encoded, copy=False)
+        with self.lock:
+            old_timeout_ms = self.timeout_ms
+            if timeout_ms is not None and timeout_ms != old_timeout_ms:
+                self.timeout_ms = timeout_ms
+                self._set_socket_timeouts(timeout_ms)
 
-            for i in range(self._world_size):
-                failed_rank = i
-                resp = self.sockets[i].recv()
-                results.append(resp)
-        except zmq.Again as e:
-            logger.error(
-                "Timeout occurred for rank %s, recreating all sockets. Error: %s",
-                failed_rank,
-                e,
-            )
-            self._recreate_all_sockets()
-            return []
-        except zmq.ZMQError as e:
-            logger.error(
-                "ZMQ error for rank %s: %s, recreating all sockets",
-                failed_rank,
-                e,
-            )
-            self._recreate_all_sockets()
-            return []
+            encoded = [self.encoder.encode(m) for m in msg]
+            results: list[bytes] = []
+            failed_rank = -1
+            try:
+                for i in range(self._world_size):
+                    failed_rank = i
+                    self.sockets[i].send_multipart(encoded, copy=False)
 
-        return results
+                for i in range(self._world_size):
+                    failed_rank = i
+                    resp = self.sockets[i].recv()
+                    results.append(resp)
+                return results
+            except zmq.Again as e:
+                logger.error(
+                    "Timeout occurred for rank %s, recreating all sockets. Error: %s",
+                    failed_rank,
+                    e,
+                )
+                self._recreate_all_sockets()
+                return []
+            except zmq.ZMQError as e:
+                logger.error(
+                    "ZMQ error for rank %s: %s, recreating all sockets",
+                    failed_rank,
+                    e,
+                )
+                self._recreate_all_sockets()
+                return []
+            finally:
+                if timeout_ms is not None and timeout_ms != old_timeout_ms:
+                    self.timeout_ms = old_timeout_ms
+                    self._set_socket_timeouts(old_timeout_ms)
 
     @property
     def world_size(self) -> int:

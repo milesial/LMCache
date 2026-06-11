@@ -94,6 +94,19 @@ class LMCacheBypassLookupClient(LookupClientInterface):
     def supports_producer_reuse(self) -> bool:
         return True
 
+    def clear_cache(self) -> bool:
+        """Clear cache through the local LMCache engine.
+
+        Returns:
+            True when the local engine clear succeeds, False otherwise.
+        """
+        try:
+            self.lmcache_engine.clear()
+        except Exception:
+            logger.exception("Error clearing LMCache")
+            return False
+        return True
+
     def close(self):
         # No resources to clean up for bypass client
         logger.info("LMCacheBypassLookupClient closed")

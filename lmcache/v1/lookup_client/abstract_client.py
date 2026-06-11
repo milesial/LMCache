@@ -6,6 +6,8 @@ import abc
 # Third Party
 import torch
 
+DEFAULT_CLEAR_CACHE_TIMEOUT_MS = 10000
+
 
 class LookupClientInterface(metaclass=abc.ABCMeta):
     """Abstract interface for lookup clients."""
@@ -75,3 +77,12 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             lookup_id: The lookup ID whose status needs to be cleared.
         """
         return
+
+    def clear_cache(self) -> bool:
+        """
+        Clear KV cache contents reachable through this lookup client.
+
+        Returns:
+            True if the cache clear completed successfully, False otherwise.
+        """
+        return False

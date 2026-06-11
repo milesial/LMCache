@@ -11,7 +11,10 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
+from lmcache.v1.lookup_client.abstract_client import (
+    DEFAULT_CLEAR_CACHE_TIMEOUT_MS,
+    LookupClientInterface,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc.transport import (
     RpcClientTransport,
@@ -19,6 +22,12 @@ from lmcache.v1.rpc.transport import (
 )
 
 logger = init_logger(__name__)
+
+# Reserved first frame for control messages. Empty trailing frames keep the
+# existing three-frame request contract used by ZmqRouterServerTransport.
+_CLEAR_CACHE_COMMAND = "__lmcache_clear_cache__"
+_CLEAR_CACHE_SUCCESS = b"\x01"
+_CLEAR_CACHE_FAILURE = b"\x00"
 
 
 class LMCacheLookupClient(LookupClientInterface):
@@ -52,6 +61,11 @@ class LMCacheLookupClient(LookupClientInterface):
     ):
         self.config = config
         self.transport = transport
+        self.clear_timeout_ms = DEFAULT_CLEAR_CACHE_TIMEOUT_MS
+        if config.extra_config is not None:
+            self.clear_timeout_ms = int(
+                config.extra_config.get("clear_cache_timeout_ms", self.clear_timeout_ms)
+            )
 
         # NOTE: map from lookup_id (i.e., req_id) to
         # req's status.
@@ -160,6 +174,32 @@ class LMCacheLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
 
+    def clear_cache(self) -> bool:
+        """Clear worker-side LMCache contents and local lookup state.
+
+        Returns:
+            True when all workers report a successful clear, False if the
+            transport fails or any worker reports a failure.
+        """
+        self.reqs_status.clear()
+        responses = self.transport.send_and_recv_all(
+            [_CLEAR_CACHE_COMMAND, "", ""],
+            timeout_ms=self.clear_timeout_ms,
+        )
+        if len(responses) != self.transport.world_size:
+            logger.warning(
+                "Clear cache returned %d responses, expected %d.",
+                len(responses),
+                self.transport.world_size,
+            )
+            return False
+
+        results = [resp == _CLEAR_CACHE_SUCCESS for resp in responses]
+        if not all(results):
+            logger.warning("Clear cache failed on at least one worker: %s.", results)
+            return False
+        return True
+
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports
         producer kvcache reuse"""
@@ -203,6 +243,16 @@ class LMCacheLookupServer:
                     # Validate frame structure
                     if len(data_frames) < 3:
                         logger.warning("Malformed request received: not enough frames.")
+                        continue
+
+                    if data_frames[0] == _CLEAR_CACHE_COMMAND:
+                        try:
+                            self.lmcache_engine.clear()
+                            response = _CLEAR_CACHE_SUCCESS
+                        except Exception:
+                            logger.exception("Error clearing LMCache")
+                            response = _CLEAR_CACHE_FAILURE
+                        self.transport.send_response(identity, response)
                         continue
 
                     # Validate and decode lookup_id
